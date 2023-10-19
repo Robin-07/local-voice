@@ -10,7 +10,7 @@ class QuickTranscription:
     Provides a public method 'listen' to start the audio stream along 
     with the live transcription.
     '''
-    def __init__(self, model_size: str = "base"):
+    def __init__(self, model_size: str = "medium.en"):
         print("INITIALIZING...")
         self._model = WhisperModel(
             model_size, 
@@ -49,9 +49,10 @@ class QuickTranscription:
         audio_data = np.frombuffer(in_data, np.int16).flatten().astype(np.float32) / 32768.0
         segments, _ = self._model.transcribe(
             audio_data, 
-            beam_size=5, 
+            beam_size=5,
             vad_filter=self._vad_filter,
             vad_parameters=dict(min_silence_duration_ms=1000),
+            condition_on_previous_text=True,
         )
         for segment in segments:
             print("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
