@@ -1,11 +1,12 @@
 # local-voice
-**A fully local Voicebot Implementation.**
+**A locally running, AI-powered Voicebot which runs on consumer-grade hardware.**
 
-## 1. Speech-to-Text
-**[faster-whisper](https://github.com/guillaumekln/faster-whisper)**
+## Approach
 
-## 2. Generating Response
-**[gpt4all](https://github.com/nomic-ai/gpt4all)**
+**The Voicebot is based on a simple end-to-end process.**
 
-## 3. Text-to-Speech
-**[pyttsx3](https://github.com/nateshmbhat/pyttsx3)**
+### 1. Audio Transcription - **[faster-whisper](https://github.com/guillaumekln/faster-whisper)**
+
+### 2. Response generation - **[gpt4all](https://github.com/nomic-ai/gpt4all)**
+
+### 3. Text-to-Speech - **[pyttsx3](https://github.com/nateshmbhat/pyttsx3)**
