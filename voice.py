@@ -13,6 +13,7 @@ from pywhispercpp.model import Model
 from pywhispercpp.utils import download_model
 
 # Config
+AUDIO_PRECISION = "int16"
 RATE, FRAME_MS = 16_000, 20
 FRAME_BYTES = RATE * FRAME_MS // 1000 * 2  # 20 ms of int16 mono
 SILENCE_PAD = 0.25  # 250 ms
@@ -21,9 +22,9 @@ LLM_MODEL = "phi3:mini"
 WHISPER_MODEL = "base.en"
 PIPER_VOICE = "./voices/en_US-lessac-medium.onnx"
 PIPER_VOICE_JSON = "./voices/en_US-lessac-medium.json"
-TTS_RATE = 22050
+TTS_RATE = 22_050
 OLLAMA_HOST = "http://localhost:11434"
-LOGLEVEL = os.getenv("VOICEBOT_LOGLEVEL", "INFO").upper()
+LOGLEVEL = os.getenv("LOCALVOICE_LOGLEVEL", "INFO").upper()
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -75,7 +76,7 @@ class LocalVoice:
             samplerate=RATE,
             channels=1,
             blocksize=FRAME_BYTES // 2,
-            dtype="int16",
+            dtype=AUDIO_PRECISION,
             callback=cb,
         ):
             buf = bytearray()
@@ -136,7 +137,7 @@ class LocalVoice:
 
     async def _speaker_task(self):
         with sd.RawOutputStream(
-            samplerate=TTS_RATE, channels=1, dtype="int16"
+            samplerate=TTS_RATE, channels=1, dtype=AUDIO_PRECISION
         ) as out:
             while True:
                 data = await self.out_q.get()
