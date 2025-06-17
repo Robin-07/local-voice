@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -16,9 +17,10 @@ from pywhispercpp.utils import download_model
 AUDIO_PRECISION = "int16"
 RATE, FRAME_MS = 16_000, 20
 FRAME_BYTES = RATE * FRAME_MS // 1000 * 2  # 20 ms of int16 mono
-SILENCE_PAD = 0.25  # 250 ms
+SILENCE_THRESHOLD = 0.25  # 250 ms of silence
 VAD_MODE = 2
-LLM_MODEL = "phi3:mini"
+ASR_INPUT_CHUNK_SIZE = RATE * 0.25 * 2  # 250 ms of speech
+LLM_MODEL = "llama3:8b"
 WHISPER_MODEL = "base.en"
 PIPER_VOICE = "./voices/en_US-lessac-medium.onnx"
 PIPER_VOICE_JSON = "./voices/en_US-lessac-medium.json"
@@ -64,13 +66,17 @@ class LocalVoice:
         self.vad = webrtcvad.Vad(VAD_MODE)
         self._ring: list[bytes] = []
         self._silence: float = 0.0
-        self.out_q = asyncio.Queue(maxsize=100)
+        self._out_q = asyncio.Queue(maxsize=100)
         self.loop = asyncio.get_event_loop()
         self.pool = ProcessPoolExecutor(max_workers=2, initializer=_init_child)
+        # boolean flags
+        self._stop_llm = False
+        self._stop_tts = False
+        self._speaking = False
 
     async def _mic_task(self):
         def cb(indata, frames, t, status):
-            self.loop.call_soon_threadsafe(self._ring.append, bytes(indata))
+            self._ring.append(bytes(indata))
 
         with sd.RawInputStream(
             samplerate=RATE,
@@ -82,21 +88,27 @@ class LocalVoice:
             buf = bytearray()
             while True:
                 if not self._ring:
-                    await asyncio.sleep(0.004)
+                    await asyncio.sleep(0.001)
                     continue
                 frame = self._ring.pop(0)
                 buf.extend(frame)
 
                 if self.vad.is_speech(frame, RATE):
                     self._silence = 0.0
+                    # self._handle_interruption(buf)
+
                 else:
                     self._silence += FRAME_MS / 1000
 
-                if self._silence > SILENCE_PAD and len(buf) > RATE * 0.3 * 2:
+                if (
+                    self._silence > SILENCE_THRESHOLD
+                    and len(buf) > ASR_INPUT_CHUNK_SIZE
+                ):
                     pcm = bytes(buf)
                     buf.clear()
                     self._silence = 0.0
                     logging.info("[AUDIO] utterance captured (%d bytes)", len(pcm))
+                    self._mark_speech_end()
                     asyncio.create_task(self._asr_task(pcm))
 
     async def _asr_task(self, pcm: bytes):
@@ -113,6 +125,10 @@ class LocalVoice:
 
         buf = []
         async for part in stream:
+            if self._stop_llm:
+                self._stop_llm = False
+                logging.info("stopping llm task...")
+                return
             token = part["message"]["content"]
             buf.append(token)
             if any(token.endswith(p) for p in ".?!") or len(buf) >= 7:
@@ -128,7 +144,11 @@ class LocalVoice:
     async def _tts_task(self, text: str):
         chunks = await self.loop.run_in_executor(self.pool, tts_worker, text)
         for c in chunks:
-            await self.out_q.put(c)
+            if self._stop_tts:
+                self._stop_tts = False
+                logging.info("stopping tts task...")
+                return
+            await self._out_q.put(c)
         logging.debug(
             "[TTS] queued %d chunks (%d bytes)",
             len(chunks),
@@ -137,12 +157,42 @@ class LocalVoice:
 
     async def _speaker_task(self):
         with sd.RawOutputStream(
-            samplerate=TTS_RATE, channels=1, dtype=AUDIO_PRECISION
+            samplerate=TTS_RATE, channels=1, dtype=AUDIO_PRECISION, latency="low"
         ) as out:
+            first_chunk = True
             while True:
-                data = await self.out_q.get()
+                data = await self._out_q.get()
+                if first_chunk:
+                    self._mark_playback_start()
+                    first_chunk = False
+                self._speaking = True
                 out.write(data)
+                if not self._speaking:
+                    try:
+                        while True:
+                            self._out_q.get_nowait()
+                            self._out_q.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                    logging.info("stopping speaker task...")
+                    continue
+                self._speaking = False
                 logging.debug("[SPEAK] wrote %d bytes", len(data))
+
+    def _handle_interruption(self, buffer):
+        if len(buffer) > ASR_INPUT_CHUNK_SIZE:
+            logging.info("detected user interruption...")
+            self._speaking = False
+            self._stop_llm = True
+            self._stop_tts = True
+
+    def _mark_speech_end(self):
+        self._speech_end_ts = time.monotonic()
+
+    def _mark_playback_start(self):
+        now = time.monotonic()
+        ms = (now - self._speech_end_ts) * 1000
+        logging.info(f"Round-trip latency: {ms:.0f} ms")
 
     def run(self):
         try:
