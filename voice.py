@@ -10,27 +10,32 @@ import sounddevice as sd
 import webrtcvad
 from ollama import AsyncClient
 from piper.voice import PiperVoice
-from pywhispercpp.model import Model
-from pywhispercpp.utils import download_model
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 # Config
-AUDIO_PRECISION = "int16"
+AUDIO_BUFFER_TYPE = "int16"
 RATE, FRAME_MS = 16_000, 20
-FRAME_BYTES = RATE * FRAME_MS // 1000 * 2  # 20 ms of int16 mono
-SILENCE_THRESHOLD = 0.25  # 250 ms of silence
-VAD_MODE = 2
-ASR_INPUT_CHUNK_SIZE = RATE * 0.25 * 2  # 250 ms of speech
-LLM_MODEL = "llama3:8b"
+FRAME_BYTES = RATE * FRAME_MS // 1000 * 2  # 20 ms of int16 audio
+SILENCE_THRESHOLD = 1  # 1s of silence
+VAD_MODE = 3
+ASR_INPUT_CHUNK_SIZE = RATE * 1 * 2  # 1 s of speech
+
+# Model pipeline config
 WHISPER_MODEL = "base.en"
+WHISPER_MODEL_PATH = "./models"
+WHISPER_COMPUTE_TYPE = "int8"
+OLLAMA_HOST = "http://localhost:11434"
+LLM_MODEL = "phi3:mini"
+SYSTEM_PROMPT = """
+You are Local Voice, a helpful AI voice assistant. Answer the user's queries in one sentence.
+"""
 PIPER_VOICE = "./voices/en_US-lessac-medium.onnx"
 PIPER_VOICE_JSON = "./voices/en_US-lessac-medium.json"
 TTS_RATE = 22_050
-OLLAMA_HOST = "http://localhost:11434"
-LOGLEVEL = os.getenv("LOCALVOICE_LOGLEVEL", "INFO").upper()
 
 logging.basicConfig(
     stream=sys.stdout,
-    level=LOGLEVEL,
+    level="INFO",
     format="%(asctime)s.%(msecs)03d | %(levelname)-7s | %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -39,21 +44,28 @@ logging.basicConfig(
 # Model Initialization (1x per worker)
 def _init_child():
     global WH_MODEL, TTS_VOICE
-    WH_MODEL = Model(
-        model=WHISPER_MODEL,
-        print_progress=False,
-        print_realtime=False,
-        single_segment=True,
-        no_context=True,
-        n_threads=max(1, os.cpu_count() // 2),
+    logging.info("initializing models...")
+    whisper_model = WhisperModel(
+        model_size_or_path=WHISPER_MODEL,
+        device="cpu",
+        compute_type=WHISPER_COMPUTE_TYPE,
+        download_root=WHISPER_MODEL_PATH,
     )
+    WH_MODEL = BatchedInferencePipeline(model=whisper_model)
     TTS_VOICE = PiperVoice.load(PIPER_VOICE, PIPER_VOICE_JSON)
 
 
 def asr_worker(pcm_bytes: bytes) -> str:
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    segments = WH_MODEL.transcribe(audio.reshape(-1, 1))
-    return " ".join(seg.text for seg in segments)
+    audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
+    segments, _ = WH_MODEL.transcribe(
+        audio=audio,
+        language="en",
+        beam_size=5,
+        batch_size=8,
+        condition_on_previous_text=True,
+        log_progress=True,
+    )
+    return " ".join([seg.text for seg in segments])
 
 
 def tts_worker(text: str) -> list[bytes]:
@@ -69,6 +81,7 @@ class LocalVoice:
         self._out_q = asyncio.Queue(maxsize=100)
         self.loop = asyncio.get_event_loop()
         self.pool = ProcessPoolExecutor(max_workers=2, initializer=_init_child)
+        self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         # boolean flags
         self._stop_llm = False
         self._stop_tts = False
@@ -82,7 +95,7 @@ class LocalVoice:
             samplerate=RATE,
             channels=1,
             blocksize=FRAME_BYTES // 2,
-            dtype=AUDIO_PRECISION,
+            dtype=AUDIO_BUFFER_TYPE,
             callback=cb,
         ):
             buf = bytearray()
@@ -95,8 +108,9 @@ class LocalVoice:
 
                 if self.vad.is_speech(frame, RATE):
                     self._silence = 0.0
-                    # self._handle_interruption(buf)
-
+                    if self._speaking and len(buf) > ASR_INPUT_CHUNK_SIZE:
+                        logging.info("detected user interruption...")
+                        self._handle_interruption()
                 else:
                     self._silence += FRAME_MS / 1000
 
@@ -107,27 +121,27 @@ class LocalVoice:
                     pcm = bytes(buf)
                     buf.clear()
                     self._silence = 0.0
-                    logging.info("[AUDIO] utterance captured (%d bytes)", len(pcm))
+                    logging.debug("[AUDIO] utterance captured (%d bytes)", len(pcm))
                     self._mark_speech_end()
                     asyncio.create_task(self._asr_task(pcm))
 
     async def _asr_task(self, pcm: bytes):
         text = await self.loop.run_in_executor(self.pool, asr_worker, pcm)
-        if text.strip():
-            logging.info("[ASR] %s", text.strip())
-            asyncio.create_task(self._llm_task(text.strip()))
+        if text:
+            logging.debug("[ASR] %s", text)
+            asyncio.create_task(self._llm_task(text))
 
     async def _llm_task(self, prompt: str):
         logging.info("[USER] %s", prompt)
+        self._messages.append({"role": "user", "content": prompt})
         stream = await self.client.chat(
-            model=LLM_MODEL, messages=[{"role": "user", "content": prompt}], stream=True
+            model=LLM_MODEL, messages=self._messages, stream=True
         )
-
         buf = []
         async for part in stream:
             if self._stop_llm:
                 self._stop_llm = False
-                logging.info("stopping llm task...")
+                logging.debug("stopping llm task...")
                 return
             token = part["message"]["content"]
             buf.append(token)
@@ -146,7 +160,7 @@ class LocalVoice:
         for c in chunks:
             if self._stop_tts:
                 self._stop_tts = False
-                logging.info("stopping tts task...")
+                logging.debug("stopping tts task...")
                 return
             await self._out_q.put(c)
         logging.debug(
@@ -157,7 +171,7 @@ class LocalVoice:
 
     async def _speaker_task(self):
         with sd.RawOutputStream(
-            samplerate=TTS_RATE, channels=1, dtype=AUDIO_PRECISION, latency="low"
+            samplerate=TTS_RATE, channels=1, dtype=AUDIO_BUFFER_TYPE, latency="low"
         ) as out:
             first_chunk = True
             while True:
@@ -174,17 +188,15 @@ class LocalVoice:
                             self._out_q.task_done()
                     except asyncio.QueueEmpty:
                         pass
-                    logging.info("stopping speaker task...")
+                    logging.debug("stopping speaker task...")
                     continue
                 self._speaking = False
                 logging.debug("[SPEAK] wrote %d bytes", len(data))
 
-    def _handle_interruption(self, buffer):
-        if len(buffer) > ASR_INPUT_CHUNK_SIZE:
-            logging.info("detected user interruption...")
-            self._speaking = False
-            self._stop_llm = True
-            self._stop_tts = True
+    def _handle_interruption(self):
+        self._speaking = False
+        self._stop_llm = True
+        self._stop_tts = True
 
     def _mark_speech_end(self):
         self._speech_end_ts = time.monotonic()
@@ -206,9 +218,5 @@ class LocalVoice:
 
 
 if __name__ == "__main__":
-    logging.info("downloading Whisper model if missing …")
-    download_model(
-        WHISPER_MODEL,
-    )
-    logging.info("starting LocalVoice (loglevel=%s)", LOGLEVEL)
+    logging.info("starting LocalVoice...")
     LocalVoice().run()
