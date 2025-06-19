@@ -19,3 +19,6 @@ flowchart TD
     SPK[Speaker <i class='fas fa-volume-up'>]
     AUDIO_OUT -->|audio| SPK
 ```
+
+## Project Demo
+A quick video demo of this project is available at https://www.loom.com/share/55a3c9d3e67c4032abc6924e67afb2c9 
