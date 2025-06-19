@@ -7,7 +7,7 @@ An AI Voicebot based on a 3-stage (STT->LLM->TTS) pipeline. The architecture pri
 
 ## Design
 ```mermaid
-flowchart TD
+flowchart LR
     subgraph Local Voice[" "]
         VAD[WebRTC VAD] -->|speech segment| BUF[Audio IN buffer]
         BUF -->|audio| ASR[Whisper] -->|transcript| llm[Ollama]
